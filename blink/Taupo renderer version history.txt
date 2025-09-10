@@ -1,0 +1,82 @@
+Taupo renderer history
+
+ParticleBlinkScriptRender node:
+
+v001 - Added a for loop to calculate motion blur from the point position and projected position using velocity pass
+v002 - Added an over merge operation
+v003 - Tried passing in camera position to calculate depth, and do some rudimentary falloff in colour and size
+v004 - More work on falloffs (adding a gamma/pow)
+v005 - Realised that depth is actually provided as part of the world to screen transform, added a better colour falloff method with near, far and falloffs for both. Added a shutter param to change the blur length.
+v006 - Trying to get a screen space size function working (using copilot, chatgpt and claude)
+v007 - I think I settled on some chatGPT that worked.
+v008 - 
+v009 - Added "screen space scale" as a checkbox.
+v010 - Trying to optimise the screen space size, realised that it was causing some sizes to blow up, so set a max size of 100px.
+v011 - Settled on that fix, tidied code a little.
+v012 - Moved size calculation into the motionblur loop, so that particles that move closer to camera would scale up over their blur length.
+v013 - Tried to add a texture rendering function. Worked, sortof, but lack of depth sorting made it very artifacty. Comment it out for now. Added adaptive steps by dividing blur length by disc size.
+v014 - Added motion blur options (start, centered, end).
+v015 - Lerp between size at start of shutter, and size at end. I guess instead of calculating every moblur step.
+v016 - Added random and 4d noise functions. Added a duplicate particles loop that duplicates them with vector noise added to P. Using point ID as a seed so it stays consistent.
+v017 - Added an additional image input to pass in camera velocity via a motionblur3d node. Only works with camera translation.
+v018 - Passing in the camera matrix, and desperately trying to reverse engineer the world to screen matrix. Learning about the difference between column major and row major matrices. 
+v019 - After a lot of pain, reverse engineered exactly how nuke does its projection matrices, by replicating the nukescripts projection function.
+
+At this point, I realised that I needed to refactor my code.
+The reason I was trying to figure out the projection matrix stuff was because I wanted to have better camera motion blur.
+I was using a vector map passed in from a motionblur3d node, but that only gave me the motion blur at a certain depth from the camera.
+So I figured I needed a way to pass in the particle depth into some sort of function that gives me 2d motion blur vectors for the camera at any depth. For that I would need access to the previous CAMERA location, but the _worldToScreen matrix magically provided by the default node only gives me the current frame.
+I thought about just using time blur, but that would mean I'd need to give up on my adaptive steps, since timeblur would define the number of steps. Then I also realised that the position information passed into blink from the particle system doesn't work with substeps, only whole frames.
+So then came the idea to pass in previous and next frame information another way. Particles would be passed into a normal blinkscript node via an image, and prev/current/next frame camera matricies passed in via three float4x4 inputs, and camera.matrix(frame-1) syntax.
+I began to refactor everything using a normal blinkscript node...
+
+Default BlinkScript node:
+
+v001 - First pass. Just reads the source pixels as P. Pass in the camera matrix, rebuild the _worldToScreen matrix and use that in the transform() function. This just got discs on screen. Yay. I should note that alongside this, I was building my own particle to points node, still using the ParticleBlinkScriptRender node.
+v002 - Added src_prev. Got motion blur in there. BUT. I tried to do everything on the first pixel of the dst, and loop through every pixel of the incoming cache. This killed concurrency.
+v003 - Ditched that first pixel idea. Now the cache is sampled once per iteration of the dst, at the same location. Added a condition to ignore pixels that are outside of the cache size. Reimplemented duplicate points, needed to pass in the ID as alpha.
+v004 - Added the next frame in as a source cache. Now we have three positions. Used chatgpt to give me a bezier function that returns a smooth curve between these points. Curved motion blur on particle motion working!
+v005 - Added cam_prev and cam_next. Modified transform function to take a worldToScreen matrix. Build w2s matrix for prev/current/next frames. Find screen position of particle on prev/current/next frames using corresponding srcs and w2s matrices. Camera motion blur working! Curved!
+v006 - Ran into an issue where particles that go behind the frustrum wig out and cause huge streaks across frame. Attempting to break out the transform/w2s step into more parts. Specifically, move the particle to clip space, so that I can clip it in clip space. Then calculate the NDC via perspective divide. This helped, but didn't completely solve the problem. Probably my clipping needs work. Might need to clip for every motion blur step, which means I would be doing a full stack of 3d transformations per motionblur sample, instead of just finding the prev/current/next 2d positions and drawing a curve between them. This is still a somewhat unsolved issue.
+v007 - updated adaptive steps to use approximate blur length (instead of doing some fancy calculation of the bezier length). Re-added shutter parameter. The curve between p0-p1-p2 is a shutter of 2.0. So I use shutter param to segment where I sample that curve.
+v008 - Updated bezier function to a lagrangian quadratic interpolation. I don't know what that means. Copilot "think deeper" finally made me a function that gives a perfect curve between p0-p1-p2.
+v008_colour - Added more input images to provide colour info. This was a test, it worked, but for now I will leave colour out of it.
+v009 - removed colour stuff. CHANGED MY CACHE CONDITIONAL TO AN || FOR SOME REASON. stupid.
+v010 - To address the scenario where the cache is larger than the dst image, added a batching loop. We now compare the size of the cache and dst image, and check how many pixels of the cache we might need to sample per iteration (dst pixel). Cache is now looked up using cache_x and cache_y variables instead of directly with pos.x, pos.y (of the dst image). Also tidied up my access logic so that we *actually* don't sample unneeded pixels.
+v011 - Tried to change the access type of the cache to point, to see if the performance boost was worth it. It wasn't, and we can't arbitrarily sample the cache with point access, so batching wouldn't work.
+v012 - Added DoF by calculating CoC (thanks to opticalZDefocus algorithm), and simply adding the CoC to the size of the rendered disc. Made a sweet comment that explained my batching logic.
+v013 - Moved dof calculation into the renderPoint function so that I can try dimming the bokeh disc depending on how large it is. Added softness to control how sharp/soft the rendered disc is.
+v014 - My naive approach to dimming the dof wasn't working. Got chatGPT (with its reasoning functionality) to help me write the correct function to take into consideration the size of the original disc on screen when figuring out how to redistribute energy over the CoC.
+v015 - Updated born/dying particle logic. In the case of a born particle, set prev_P to P, and then set P to halfway between P and next_P.
+
+
+
+To do:
+
+Fix or rethink the logic behind which pixels get counted as particles and rendered. Currently, we use alpha channel as ID so we can use it to validate that we're rendering the same particle between the src prev/current/next, and so we can use it for the replicator noise. However this means that all point positions are rendered if the cache is just a position pass instead of the particle to image cache. Point Render (hagbarth) and the particle to image node just uses alpha as active or not, which would be nice. Maybe if id == -1, then it is inactive? Would require people to remember to set that. Maybe 0 would make more sense, but then it'll never render the first particle..? Not that big of a deal I guess lol. 
+
+Cat eye defocus
+Spherical / chromatic abberation with spectral gradient texture.
+
+Restore over merge operation
+Look into hacky over/under conditional based on min depth?
+
+
+Perhaps refactor the cache to be split into three. Bottom third is position and active? Middle is colour (rgba). Top is utility (size, age, life, id). We'd still only calculate the batching based on the third. Sampling the other two would just be an offset. Would be spicy to accidentally sample a neighbouring cache lol. That code will have to be TIGHT. But then I could have pos, id, colour, size, age and life with just one image, three images for motion blur.
+
+Refactor everything to optimise.
+    Don't even read any prev/next if there's no motion blur. Might need to split point and camera motion blur.
+    Ensure only one step is rendered if no motion blur.
+    Don't do anything with dof/coc if it's not enabled.
+    If we refactor the caches, try to detect whether it's a native triplet cache, or just a position pass. Don't bother sampling colour/utility cache tiles if it's just a position pass. Then we might be able to support basic position passes and full caches with the same node.
+
+Add options for max bokeh size, max particle size
+    
+
+
+Randomise colour
+Randomise size
+Need new cache system:
+    Size over life..?
+    Colour over life..?
+Cull percentage
