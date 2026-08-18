@@ -1,8 +1,9 @@
 def sample_box_pos():
     viewer = nuke.activeViewer()
+    viewer_input_index = viewer.activeInput()
     v = viewer.node()
     bbox = v['colour_sample_bbox']
-    n = v.input(0)
+    n = v.input(viewer_input_index)
     w = n.width()
     h = n.height()
     pa = n.pixelAspect()
